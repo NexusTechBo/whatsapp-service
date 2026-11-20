@@ -34,7 +34,6 @@ async function shutdown(signal: string) {
     process.exit(0);
 }
 
-// A failure inside one WhatsApp session (e.g. a Baileys background write) must not kill every session.
 process.on('unhandledRejection', (err) => {
     logger.error({ err }, 'Unhandled promise rejection');
 });
