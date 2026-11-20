@@ -3,6 +3,7 @@ import path from 'node:path';
 import makeWASocket, {
     Browsers,
     DisconnectReason,
+    jidDecode,
     useMultiFileAuthState,
     type WASocket,
 } from '@whiskeysockets/baileys';
@@ -13,7 +14,7 @@ import { HttpError } from '../utils/httpError.ts';
 import { normalizePhone } from '../utils/phone.ts';
 import { createSendQueue } from './sendQueue.ts';
 
-export type SessionStatus = 'IDLE' | 'INITIALIZING' | 'QR_PENDING' | 'READY' | 'DISCONNECTED';
+export type SessionStatus = 'IDLE' | 'INITIALIZING' | 'QR_PENDING' | 'PAIRING_PENDING' | 'READY' | 'DISCONNECTED';
 
 export interface SendMessageInput {
     to: string;
@@ -21,12 +22,19 @@ export interface SendMessageInput {
 }
 
 const QR_WAIT_TIMEOUT_MS = 60_000;
+const QR_TIMEOUT_MS = 20_000;
 const RECONNECT_DELAY_MS = 3_000;
+
+function phoneFromJid(jid: string | undefined): string | null {
+    return (jid && jidDecode(jid)?.user) || null;
+}
 
 export class WhatsAppSession {
     readonly id: string;
     status: SessionStatus = 'IDLE';
     qr: string | null = null;
+    pairingCode: string | null = null;
+    phone: string | null = null;
 
     private readonly dir: string;
     private readonly log: Logger;
@@ -35,6 +43,8 @@ export class WhatsAppSession {
     private readonly onDiscard: (session: WhatsAppSession) => void;
     private sock: WASocket | null = null;
     private qrCount = 0;
+    private pairingPhone: string | null = null;
+    private pairingRequest: Promise<string> | null = null;
     private stopping = false;
 
     constructor(id: string, onDiscard: (session: WhatsAppSession) => void) {
@@ -48,7 +58,7 @@ export class WhatsAppSession {
     async hasLinkedCredentials(): Promise<boolean> {
         try {
             const creds = JSON.parse(await readFile(path.join(this.dir, 'creds.json'), 'utf8'));
-            return Boolean(creds.me);
+            return Boolean(creds.account);
         } catch {
             return false;
         }
@@ -60,10 +70,13 @@ export class WhatsAppSession {
         this.status = 'INITIALIZING';
         this.qr = null;
         this.qrCount = 0;
+        this.clearPairing();
 
         const { state: authState, saveCreds } = await useMultiFileAuthState(this.dir);
+        if (authState.creds.account) this.phone = phoneFromJid(authState.creds.me?.id);
         const socket = makeWASocket({
             auth: authState,
+            qrTimeout: QR_TIMEOUT_MS,
             logger: this.baileysLog,
             browser: Browsers.ubuntu('Chrome'),
             markOnlineOnConnect: false,
@@ -71,31 +84,39 @@ export class WhatsAppSession {
         });
         this.sock = socket;
 
-        socket.ev.on('creds.update', saveCreds);
+        socket.ev.on('creds.update', () => {
+            if (this.sock !== socket) return;
+            saveCreds().catch((err) => this.log.error({ err }, 'Could not save credentials'));
+        });
 
         socket.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+            if (this.sock !== socket) return;
+
             if (qr) {
                 this.qrCount++;
-                if (this.qrCount > config.qrMaxRetries) {
+                if (!this.pairingCode && this.qrCount > config.qrMaxRetries) {
                     await socket.end(new Error('QR attempts exhausted'));
                     return;
                 }
-                if (!this.qr) {
+                if (!this.qr && !this.pairingCode) {
                     this.log.info(`QR code available at GET /api/sessions/${this.id}/qr`);
                 }
-                this.status = 'QR_PENDING';
+                if (!this.pairingCode) this.status = 'QR_PENDING';
                 this.qr = qr;
             }
 
             if (connection === 'open') {
                 this.status = 'READY';
                 this.qr = null;
+                this.phone = phoneFromJid(socket.user?.id);
+                this.clearPairing();
                 this.log.info({ jid: socket.user?.id }, 'WhatsApp client ready');
             }
 
             if (connection === 'close') {
-                if (this.sock === socket) this.sock = null;
+                this.sock = null;
                 this.qr = null;
+                this.clearPairing();
                 const statusCode = (lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output
                     ?.statusCode;
 
@@ -107,7 +128,7 @@ export class WhatsAppSession {
                     return;
                 }
 
-                if (statusCode === DisconnectReason.loggedOut || !authState.creds.me) {
+                if (statusCode === DisconnectReason.loggedOut || !authState.creds.account) {
                     this.log.info({ statusCode }, 'No linked session; session discarded');
                     await this.discard();
                     return;
@@ -124,7 +145,53 @@ export class WhatsAppSession {
         if (this.status === 'IDLE' || (this.status === 'DISCONNECTED' && !this.sock)) {
             await this.connect();
         }
+        return this.waitForQr();
+    }
 
+    async requestPairingCode(rawPhone: string): Promise<string> {
+        const phone = normalizePhone(rawPhone);
+        if (!phone) {
+            throw new HttpError(400, 'Invalid phone number: it must include the country code', { phone: rawPhone });
+        }
+        if (this.status === 'READY' || this.status === 'DISCONNECTED') {
+            throw new HttpError(409, 'Session is already linked', { session: this.id, status: this.status });
+        }
+        if (this.pairingPhone === phone) {
+            if (this.pairingRequest) return this.pairingRequest;
+            if (this.pairingCode && this.sock) return this.pairingCode;
+        }
+
+        const request = this.startPairing(phone);
+        this.pairingPhone = phone;
+        this.pairingRequest = request;
+        try {
+            return await request;
+        } finally {
+            if (this.pairingRequest === request) this.pairingRequest = null;
+        }
+    }
+
+    private async startPairing(phone: string): Promise<string> {
+        if (this.status === 'IDLE') await this.connect();
+
+        if ((await this.waitForQr()) === null || !this.sock) {
+            throw new HttpError(409, 'Session is already linked', { session: this.id, status: this.status });
+        }
+
+        const code = await this.sock.requestPairingCode(phone);
+        const formatted = `${code.slice(0, 4)}-${code.slice(4)}`;
+        this.pairingCode = formatted;
+        this.status = 'PAIRING_PENDING';
+        this.log.info({ phone }, 'Pairing code generated');
+        return formatted;
+    }
+
+    private clearPairing(): void {
+        this.pairingCode = null;
+        this.pairingPhone = null;
+    }
+
+    private async waitForQr(): Promise<string | null> {
         const deadline = Date.now() + QR_WAIT_TIMEOUT_MS;
         while (!this.qr) {
             if (this.status === 'READY') return null;
@@ -145,11 +212,11 @@ export class WhatsAppSession {
             throw new HttpError(409, 'No active session', { session: this.id, status: this.status });
         }
         this.sock = null;
-        this.stopping = true;
         try {
             await socket.logout();
-        } finally {
-            this.stopping = false;
+        } catch (err) {
+            this.log.warn({ err }, 'Logout request failed; closing socket anyway');
+            await socket.end(undefined);
         }
         await this.discard();
     }
@@ -201,6 +268,8 @@ export class WhatsAppSession {
         );
         this.status = 'IDLE';
         this.qr = null;
+        this.phone = null;
+        this.clearPairing();
         this.onDiscard(this);
     }
 }

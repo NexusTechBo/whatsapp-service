@@ -11,7 +11,7 @@ export const config = {
     apiKey: required('API_KEY'),
     sessionPath: process.env.WA_SESSION_PATH ?? '.baileys_auth',
     maxSessions: Number(process.env.WA_MAX_SESSIONS ?? 5),
-    qrMaxRetries: Number(process.env.WA_QR_MAX_RETRIES ?? 5),
+    qrMaxRetries: Number(process.env.WA_QR_MAX_RETRIES ?? 6),
     sendDelayMs: Number(process.env.SEND_DELAY_MS ?? 1500),
     logLevel: process.env.LOG_LEVEL ?? 'info',
 };
