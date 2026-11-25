@@ -34,5 +34,9 @@ async function shutdown(signal: string) {
     process.exit(0);
 }
 
+process.on('unhandledRejection', (err) => {
+    logger.error({ err }, 'Unhandled promise rejection');
+});
+
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

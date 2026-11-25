@@ -68,7 +68,7 @@ export async function restoreSessions(): Promise<void> {
         await session.connect();
     }
 
-    logger.info({ restored: sessions.size }, 'Sessions restored; request new ones with GET /api/sessions/:id/qr');
+    logger.info({ restored: sessions.size }, 'Sessions restored; link new ones with GET /api/sessions/:id/qr or POST /api/sessions/:id/pairing-code');
 }
 
 export async function stopAllSessions(): Promise<void> {
